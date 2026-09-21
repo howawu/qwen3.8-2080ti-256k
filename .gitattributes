@@ -1,0 +1,9 @@
+# Line endings: patches and shell scripts must survive a clone on any platform,
+# otherwise `git apply` sees CR characters the source tree does not have and the
+# shell refuses the CRLF shebang.
+* text=auto
+
+*.patch text eol=lf
+*.diff  text eol=lf
+*.sh    text eol=lf
+*.md    text eol=lf
