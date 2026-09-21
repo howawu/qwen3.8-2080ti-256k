@@ -1,0 +1,53 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 6305230..1a51605 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -365,6 +365,48 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
+         }
+     }
++    if (GGML_CUDA_CC_IS_NVIDIA(cc) && cc == GGML_CUDA_CC_TURING) {
++        // Turing has no per-quant tuning table above and falls through to MMVQ_MAX_BATCH_SIZE,
++        // which sends speculative-decoding verification batches (draft depth + 1) to MMVQ.
++        // MMVQ re-decodes the weights once per column, so at that width it loses badly to MMQ
++        // on Turing's limited bandwidth. Only list quant types MMQ actually supports.
++        static const int mmvq_max_turing = []() {
++            const char * env = getenv("GGML_MMVQ_MAX");
++            const int v = env ? atoi(env) : 2;
++            return v > 0 ? v : MMVQ_MAX_BATCH_SIZE;
++        }();
++        // Experimental (env GGML_MMVQ_ALL=1): extend the Turing threshold to every quant type
++        // MMQ supports, instead of IQ4_XS only. Lets one build A/B "all types on MMQ" against
++        // "IQ4_XS only" without recompiling; off by default so existing behaviour is unchanged.
++        static const bool mmvq_all_turing = []() {
++            const char * env = getenv("GGML_MMVQ_ALL");
++            return env != nullptr && atoi(env) != 0;
++        }();
++        if (mmvq_all_turing) {
++            switch (type) {
++                case GGML_TYPE_IQ4_XS:
++                case GGML_TYPE_IQ3_S:
++                case GGML_TYPE_IQ3_XXS:
++                case GGML_TYPE_IQ2_S:
++                case GGML_TYPE_IQ2_XS:
++                case GGML_TYPE_IQ2_XXS:
++                case GGML_TYPE_IQ1_M:
++                case GGML_TYPE_Q4_K:
++                case GGML_TYPE_Q5_K:
++                case GGML_TYPE_Q6_K:
++                case GGML_TYPE_Q2_K:
++                    return ne11 <= mmvq_max_turing;
++                default:
++                    return ne11 <= MMVQ_MAX_BATCH_SIZE;
++            }
++        }
++        switch (type) { // tuned on RTX 2080 Ti (22 GB mod)
++            case GGML_TYPE_IQ4_XS:
++                return ne11 <= mmvq_max_turing;
++            default:
++                return ne11 <= MMVQ_MAX_BATCH_SIZE;
++        }
++    }
+     if (GGML_CUDA_CC_IS_CDNA(cc)) {
+         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
+             switch (type) {

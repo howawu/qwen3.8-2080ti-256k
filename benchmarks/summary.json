@@ -9,7 +9,10 @@
   },
   "decode": {
     "simple_code_generation_cold_median_tok_s": 66.92,
-    "simple_code_generation_cold_range_tok_s": [56.35, 74.98],
+    "simple_code_generation_cold_range_tok_s": [
+      56.35,
+      74.98
+    ],
     "validated_matlab_kalman_tok_s": 44.87,
     "typical_interactive_claim_tok_s": "approximately 45-48; prompt dependent"
   },
@@ -30,5 +33,86 @@
     "before_tok_s": 35.72,
     "after_tok_s": 44.87,
     "improvement_percent": 25.63
-  }
+  },
+  "model_files": [
+    {
+      "path": "Q2-LynnStyle/Qwen3.8-27B-EfficientThink-SimPO-Q2-LynnStyle.gguf",
+      "role": "target model, text-only, no MTP head",
+      "bytes": 12999977600,
+      "sha256": "8a84f7ef93b01c6376a19fc80fd9df849d23d5785e5953bd3e4fc278d5d21922"
+    },
+    {
+      "path": "Q2-LynnStyle/dflash2-qwen38-27b-Q4_K_M.gguf",
+      "role": "DFlash2 drafter used by both run modes",
+      "bytes": 1143006720,
+      "sha256": "e83676f81b6604331d02e004a50689eded7fa905c7e83468e5a376cc27abcad4"
+    },
+    {
+      "path": "Q2-LynnStyle/mmproj-Qwen3.8-27B-Q4_K_M.gguf",
+      "role": "optional vision projector",
+      "bytes": 522293024,
+      "sha256": "0d22c439a59fb0ffb784530babc4f03a10581484b7ac68d9a5707fc0d7675d48"
+    },
+    {
+      "path": "Q2-LynnStyle/dflash2-qwen38-27b-Q8_0.gguf",
+      "role": "alternative larger DFlash2 drafter",
+      "bytes": 2056414720,
+      "sha256": "1086ea5d44e9d7b3ee1978ce322c01f96d9c1086bd5e73d89397be7a2af1335a"
+    }
+  ],
+  "model_source": {
+    "repository": "nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF",
+    "directory": "Q2-LynnStyle",
+    "url": "https://huggingface.co/nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF",
+    "chat_template": {
+      "repository": "froggeric/Qwen-Fixed-Chat-Templates",
+      "url": "https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates",
+      "version_string": "qwen3.8-froggeric-v22.4",
+      "sha256": "c47c82b0544752d454f4e427228d9d9d8c3df64c9e446cbd0229362f67948009"
+    }
+  },
+  "run_modes": {
+    "A_upstream_llama_cpp_dflash2_128k": {
+      "engine": "llama.cpp 16378d93f94012d4228c8c7683adce3f286aee5d + Turing MMVQ->MMQ routing patch",
+      "context_tokens": 131072,
+      "kv_type": "q8_0/q8_0",
+      "spec_type": "draft-dflash,ngram-mod",
+      "spec_draft_n_max": 6,
+      "env": {
+        "GGML_MMVQ_MAX": 4,
+        "GGML_MMVQ_ALL": 1
+      },
+      "short_context_decode_tok_s": 64.7,
+      "decode_at_125k_context_tok_s": 30.8,
+      "prefill_tok_s_range": [
+        361,
+        380
+      ],
+      "vram_used_mib_range": [
+        21134,
+        21633
+      ],
+      "free_headroom_mib_range": [
+        895,
+        1394
+      ],
+      "dflash2_draft_acceptance": 0.84,
+      "turing_mmvq_route_vs_stock_percent": 48.9,
+      "dflash2_depth_curve_tok_s": {
+        "n4": 53.4,
+        "n5": 53.4,
+        "n6": 54.9,
+        "n7": 54.6,
+        "n8": 53.0
+      }
+    },
+    "B_kvmem_256k_logical": {
+      "engine": "KVMem llama-kvmem-server (see docs/ENGINE_NOTES.md)",
+      "context_tokens_logical": 262144,
+      "kvmem_budget_tokens": 96256,
+      "generation_reserve_tokens": 16384,
+      "physical_working_set_tokens": 112640
+    }
+  },
+  "notes": "Mode A and mode B figures are measured on different configurations of the same card and must not be combined. Headline decode figures in this file are mode B unless stated otherwise. Reproduction checklist: docs/LAUNCH_PARAMS.md section 4."
 }

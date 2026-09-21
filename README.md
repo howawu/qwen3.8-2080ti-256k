@@ -24,7 +24,29 @@ A performance-first recipe that pushes a modified 22 GB RTX 2080 Ti close to its
 - **Cross-request prefix reuse:** a checkpoint fix reduced a measured 11K-token follow-up prefill from 21.7 s to 0.356 s.
 - **Turing-aware verifier routing:** the local MMVQ→MMQ route improved the MATLAB workload from 35.72 to 44.87 tok/s.
 
+## Two run modes, one card
+
+The repository documents **two launch configurations**, both of which bind `127.0.0.1:8080` and consume the same model files. A 22 GB card fits one of them at a time, so sharing the port means every client, proxy and IDE integration keeps working whichever one is running.
+
+| Mode | Engine | Context | Launcher | Character |
+|---|---|---:|---|---|
+| **A** | upstream llama.cpp + DFlash2 | 131,072 | [`scripts/start-llama.ps1`](scripts/start-llama.ps1) | daily driver: lowest latency per token, most VRAM headroom |
+| **B** | KVMem | 262,144 logical | [`scripts/start-kvmem.ps1`](scripts/start-kvmem.ps1) | long-context mode: 112,640-token physical working set, older context retrieved |
+
+Every flag, environment variable, VRAM item and known pitfall is written down in **[docs/LAUNCH_PARAMS.md](docs/LAUNCH_PARAMS.md)**, including the eleven things that most often break a reproduction.
+
 ## Measured envelope
+
+**Mode A (llama.cpp + DFlash2, 128K), code prompt, `temp=0`:**
+
+| Workload | Result |
+|---|---:|
+| Short-context decode | **64.7 tok/s** |
+| Decode at 125K context | **30.8 tok/s** |
+| Prefill | 361–380 tok/s |
+| Turing verifier routing (MATLAB task) | 35.72 → **44.87 tok/s** |
+
+**Mode B (KVMem, 256K logical):**
 
 | Workload | Result |
 |---|---:|
@@ -34,19 +56,36 @@ A performance-first recipe that pushes a modified 22 GB RTX 2080 Ti close to its
 | Same code request with warm n-gram state | **227.65 tok/s median**, 3.23× vs first run |
 | Cached 11K-token follow-up prefill | **0.356 s**, 61× vs broken-cache baseline |
 
-See [measurement conditions and claim boundaries](docs/BENCHMARKS.md).
+Numbers belong to the mode that produced them; they are not interchangeable. See [measurement conditions and claim boundaries](docs/BENCHMARKS.md).
 
 ## Memory layout
 
 ```text
-target weights                         12.11 GiB
-draft weights                           1.06 GiB
-target KV: 96,256 + 16,384 tokens       3.65 GiB
-draft KV at 262,144 logical tokens      2.60 GiB
-recommended free headroom              >= 0.8 GiB
+                              mode A (128K)      mode B (256K logical)
+target weights                  12.11 GiB          12.11 GiB
+draft weights                    1.06 GiB           1.06 GiB
+target KV                    q8_0/q8_0 @128K    112,640-token pool, 3.65 GiB
+draft KV                     small, f16         262,144 x 10.6 KiB, 2.60 GiB
+free headroom to keep          >= 0.8 GiB         >= 0.8 GiB
 ```
 
 The 256K claim is a **logical context capacity**, not 256K tokens of fully resident target KV.
+
+## What to download
+
+Weights and binaries are not redistributed here. Three files are needed, all from one GGUF release — the **`Q2-LynnStyle`** directory of
+[`nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF`](https://huggingface.co/nerkyor/Qwen3.8-27B-EfficientThink-Uncensored-K3-Opus5-Grok4.6-GPT5.6Sol-SFT-SimPO-DFlash2-GGUF):
+
+| File | Role | SHA256 (first 16) |
+|---|---|---:|
+| `Qwen3.8-27B-EfficientThink-SimPO-Q2-LynnStyle.gguf` | target model (12.11 GiB) | `8a84f7ef93b01c63` |
+| `dflash2-qwen38-27b-Q4_K_M.gguf` | DFlash2 drafter (1.06 GiB) | `e83676f81b660433` |
+| `mmproj-Qwen3.8-27B-Q4_K_M.gguf` | vision projector, optional (0.50 GiB) | `0d22c439a59fb0ff` |
+
+A fourth, non-model file matters for reproduction: the chat template from
+[`froggeric/Qwen-Fixed-Chat-Templates`](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) (v22 generation), because that is what implements `reasoning_effort`.
+
+**[docs/MODELS.md](docs/MODELS.md)** has the full file list, byte sizes, complete checksums, the `hf download` command, the manifest facts that drive the tuning (mixed `IQ3_S`/`IQ4_XS` tensor mix, text-only/no-MTP target) and the license notes.
 
 ## Quick start
 
@@ -54,19 +93,45 @@ Requirements:
 
 - Windows 11
 - NVIDIA Turing GPU with 22 GB VRAM (validated on RTX 2080 Ti 22 GB)
-- A compatible `llama-kvmem-server.exe` built for `75-real`
+- Mode A: `llama-server.exe` from llama.cpp `16378d9` built with the [Turing routing patch](patches/turing-mmvq-mmq-routing.diff)
+- Mode B: a compatible `llama-kvmem-server.exe` built for `75-real`
 - Target GGUF, DFlash2 drafter, optional mmproj and chat template
 
 ```powershell
 Copy-Item .\config.example.ps1 .\config.ps1
 notepad .\config.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\check-config.ps1
+
+# Mode A: 128K, upstream llama.cpp + DFlash2
+powershell -ExecutionPolicy Bypass -File .\scripts\start-llama.ps1
+
+# Mode B: 256K logical, KVMem
 powershell -ExecutionPolicy Bypass -File .\scripts\start-kvmem.ps1
 ```
 
-Run the start script again to stop the service. It refuses to kill another process that already owns the port.
+Run a start script again to stop the service it started. It refuses to kill another process that already owns the port.
 
 ## Core configuration
+
+**Mode A — 128K daily driver:**
+
+```text
+--ctx-size 131072 --parallel 1
+--n-gpu-layers all --fit off
+--flash-attn on
+--cache-type-k q8_0 --cache-type-v q8_0
+--spec-type draft-dflash,ngram-mod
+--spec-draft-n-max 6
+--spec-draft-type-k f16 --spec-draft-type-v f16
+--mmproj ... --mmproj-device none --no-mmproj-offload
+--reasoning on --reasoning-effort low
+--temp 0.7 --top-k 20 --top-p 0.8
+-b 1024 -ub 512 --threads 8 --threads-batch 8
+GGML_MMVQ_MAX=4
+GGML_MMVQ_ALL=1
+```
+
+**Mode B — 256K logical:**
 
 ```text
 -c 262144
@@ -88,10 +153,12 @@ The pelican animation was produced from a prompt asking the local model to creat
 ## Important boundaries
 
 - Model weights and binaries are not included.
-- The KVMem outer repository currently has no declared license, so this repo does not redistribute its source or the cumulative derivative patch. See [engine notes](docs/ENGINE_NOTES.md).
+- The two run modes are measured separately; mixing their figures overstates or understates both.
+- The KVMem outer repository currently has no declared license, so this repo does not redistribute its source or the cumulative derivative patch. See [engine notes](docs/ENGINE_NOTES.md). The Turing routing patch in `patches/` is our own change to MIT-licensed llama.cpp and is published here.
 - Speed changes with speculative acceptance rate. Repeated-context numbers are not general prose throughput.
 - The Q4_K_M comparison and reduced-overthinking statement are operator evaluations, clearly separated from measured throughput.
 - Long-context retrieval can trade exact full-history attention for a bounded GPU working set.
+- The n-gram speedup was measured with a *repeated* prompt. Repeating one prompt keeps the lookup table warm across requests and inflates the number; use independent cold prompts when benchmarking.
 
 ## License
 

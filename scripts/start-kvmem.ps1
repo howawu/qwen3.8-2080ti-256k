@@ -38,8 +38,10 @@ $stdout = Join-Path $LogDir "kvmem-$timestamp.out.log"
 $stderr = Join-Path $LogDir "kvmem-$timestamp.err.log"
 
 $env:KVMEM_LAZY_DECODE_MEAN = '1'
-$env:GGML_MMVQ_MAX = '4'
-$env:GGML_MMVQ_ALL = '1'
+# Turing MMVQ->MMQ routing, same per-weight-set caveat as mode A:
+# GGML_MMVQ_ALL=1 is required for this IQ3_S-heavy weight set.
+$env:GGML_MMVQ_MAX = $(if ($MmvqMax) { "$MmvqMax" } else { '4' })
+$env:GGML_MMVQ_ALL = $(if ($MmvqAll) { "$MmvqAll" } else { '1' })
 
 function Quote-WindowsArg([string]$value) {
     return '"' + $value.Replace('"', '\"') + '"'
