@@ -1,0 +1,34 @@
+{
+  "hardware": "NVIDIA GeForce RTX 2080 Ti 22 GB, sm_75",
+  "target_model": "Qwen3.8-27B EfficientThink Q2 recipe",
+  "context": {
+    "logical_tokens": 262144,
+    "gpu_kv_budget_tokens": 96256,
+    "generation_reserve_tokens": 16384,
+    "physical_working_set_tokens": 112640
+  },
+  "decode": {
+    "simple_code_generation_cold_median_tok_s": 66.92,
+    "simple_code_generation_cold_range_tok_s": [56.35, 74.98],
+    "validated_matlab_kalman_tok_s": 44.87,
+    "typical_interactive_claim_tok_s": "approximately 45-48; prompt dependent"
+  },
+  "ngram_repeated_context_demo": {
+    "first_run_tok_s": 70.39,
+    "repeat_run_median_tok_s": 227.65,
+    "speedup_x": 3.23,
+    "scope": "same code-generation request repeated in one warm process; demonstrates intended n-gram reuse, not general throughput"
+  },
+  "prefix_cache": {
+    "before_ms": 21727,
+    "after_ms": 356,
+    "speedup_x": 61.0,
+    "cached_tokens": 11165,
+    "new_tokens": 23
+  },
+  "turing_mmq_fix": {
+    "before_tok_s": 35.72,
+    "after_tok_s": 44.87,
+    "improvement_percent": 25.63
+  }
+}
