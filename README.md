@@ -94,19 +94,23 @@ Requirements:
 - Windows 11
 - NVIDIA Turing GPU with 22 GB VRAM (validated on RTX 2080 Ti 22 GB)
 - Mode A: `llama-server.exe` from llama.cpp `16378d9` built with the [Turing routing patch](patches/turing-mmvq-mmq-routing.diff)
-- Mode B: a compatible `llama-kvmem-server.exe` built for `75-real`
+- Mode B: the KVMem engine — clone upstream and replay the two patches in `patches/` (one command on Windows: `scripts\bootstrap-engine.ps1 -Build`)
 - Target GGUF, DFlash2 drafter, optional mmproj and chat template
 
 ```powershell
+# 1. engine: upstream KVMem + the published patches (mode B; mode A additionally
+#    needs llama.cpp 16378d9 + patches/turing-mmvq-mmq-routing.diff)
+git clone https://github.com/kvmem/kvmem-llama.cpp
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-engine.ps1 -Build
+
+# 2. configuration
 Copy-Item .\config.example.ps1 .\config.ps1
 notepad .\config.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\check-config.ps1
 
-# Mode A: 128K, upstream llama.cpp + DFlash2
-powershell -ExecutionPolicy Bypass -File .\scripts\start-llama.ps1
-
-# Mode B: 256K logical, KVMem
-powershell -ExecutionPolicy Bypass -File .\scripts\start-kvmem.ps1
+# 3. run one of the two modes
+powershell -ExecutionPolicy Bypass -File .\scripts\start-llama.ps1   # Mode A: 128K, llama.cpp + DFlash2
+powershell -ExecutionPolicy Bypass -File .\scripts\start-kvmem.ps1   # Mode B: 256K logical, KVMem
 ```
 
 Run a start script again to stop the service it started. It refuses to kill another process that already owns the port.
@@ -154,7 +158,7 @@ The pelican animation was produced from a prompt asking the local model to creat
 
 - Model weights and binaries are not included.
 - The two run modes are measured separately; mixing their figures overstates or understates both.
-- The KVMem outer repository currently has no declared license, so this repo does not redistribute its source or the cumulative derivative patch. See [engine notes](docs/ENGINE_NOTES.md). The Turing routing patch in `patches/` is our own change to MIT-licensed llama.cpp and is published here.
+- The KVMem outer repository declares no license, so its sources are not bundled here. The integration is published instead as replayable diffs against pinned upstream commits ([`patches/`](patches/README.md)) with a one-command replay, and the replayed tree is byte-identical to the one the measurements were taken on. The Turing routing patch is our own change to MIT-licensed llama.cpp.
 - Speed changes with speculative acceptance rate. Repeated-context numbers are not general prose throughput.
 - The Q4_K_M comparison and reduced-overthinking statement are operator evaluations, clearly separated from measured throughput.
 - Long-context retrieval can trade exact full-history attention for a bounded GPU working set.

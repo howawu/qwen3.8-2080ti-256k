@@ -94,19 +94,23 @@
 - Windows 11
 - 22 GB 显存的 NVIDIA Turing 显卡（在 RTX 2080 Ti 22 GB 上验证）
 - 模式 A：llama.cpp `16378d9` 构建出的 `llama-server.exe`，并应用 [Turing 路由补丁](patches/turing-mmvq-mmq-routing.diff)
-- 模式 B：按 `75-real` 构建的兼容 `llama-kvmem-server.exe`
+- 模式 B：KVMem 引擎——克隆上游后重放 `patches/` 里的两份补丁（Windows 一条命令：`scripts\bootstrap-engine.ps1 -Build`）
 - 目标 GGUF、DFlash2 草稿模型、可选 mmproj 和聊天模板
 
 ```powershell
+# 1. 引擎：上游 KVMem + 本仓库发布的补丁（模式 B；模式 A 另需 llama.cpp 16378d9
+#    + patches/turing-mmvq-mmq-routing.diff）
+git clone https://github.com/kvmem/kvmem-llama.cpp
+powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap-engine.ps1 -Build
+
+# 2. 配置
 Copy-Item .\config.example.ps1 .\config.ps1
 notepad .\config.ps1
 powershell -ExecutionPolicy Bypass -File .\scripts\check-config.ps1
 
-# 模式 A：128K，上游 llama.cpp + DFlash2
-powershell -ExecutionPolicy Bypass -File .\scripts\start-llama.ps1
-
-# 模式 B：256K 逻辑上下文，KVMem
-powershell -ExecutionPolicy Bypass -File .\scripts\start-kvmem.ps1
+# 3. 启动其中一种模式
+powershell -ExecutionPolicy Bypass -File .\scripts\start-llama.ps1   # 模式 A：128K，llama.cpp + DFlash2
+powershell -ExecutionPolicy Bypass -File .\scripts\start-kvmem.ps1   # 模式 B：256K 逻辑上下文，KVMem
 ```
 
 再次运行同一启动脚本会停止它启动的服务；若端口被其他程序占用，它只报错，不会静默杀掉用户正在使用的服务。
@@ -156,7 +160,7 @@ GGML_MMVQ_ALL=1
 - 两套运行模式的数字分别测量，不可混用。
 - n-gram 高速数据只代表重复上下文命中，不代表全新文本的通用速度；它用**重复提示词**测得，同一提示连发会让查找表跨请求存活并虚高，基准测试请用独立冷提示。
 - “接近 Q4_K_M”和“减少过度思考”是使用评价，不冒充标准化质量 benchmark。
-- KVMem 外层仓库目前没有声明许可证，因此本仓库只发布原创部署脚本、配置和数据，不转发其源码或累计衍生补丁；`patches/` 中的 Turing 路由补丁是我们对 MIT 许可的 llama.cpp 的自行改动，在此一并发布。实现清单见 [docs/ENGINE_NOTES.md](docs/ENGINE_NOTES.md)。
+- KVMem 外层仓库没有声明许可证，因此本仓库不打包其源码；集成改动以可重放的补丁发布（[`patches/`](patches/README.md)），并配一条命令的重放脚本，重放结果与实测所用源码逐字节一致。`patches/` 中的 Turing 路由补丁是我们对 MIT 许可 llama.cpp 的自行改动。实现清单见 [docs/ENGINE_NOTES.md](docs/ENGINE_NOTES.md)。
 
 ## 许可证
 

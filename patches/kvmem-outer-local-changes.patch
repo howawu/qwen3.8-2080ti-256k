@@ -1,0 +1,984 @@
+diff --git a/kvmem/include/kvmem/raw_kv_store.hpp b/kvmem/include/kvmem/raw_kv_store.hpp
+index 9641888..651b086 100644
+--- a/kvmem/include/kvmem/raw_kv_store.hpp
++++ b/kvmem/include/kvmem/raw_kv_store.hpp
+@@ -67,6 +67,7 @@ public:
+     bool has_k_gpu(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
+     bool has_v(uint32_t block_id, uint32_t il) const;
+     bool has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
++    bool has_mean(uint32_t block_id, uint32_t il, uint32_t n = 1) const;
+     uint32_t n_tokens(uint32_t block_id) const;
+ 
+     bool copy_k(uint32_t block_id, uint32_t il, float * out) const;
+diff --git a/kvmem/src/host/raw_kv_store.cpp b/kvmem/src/host/raw_kv_store.cpp
+index 2ef021d..b9d467e 100644
+--- a/kvmem/src/host/raw_kv_store.cpp
++++ b/kvmem/src/host/raw_kv_store.cpp
+@@ -770,6 +770,15 @@ bool RawKvStore::has_v_gpu(uint32_t block_id, uint32_t il, uint32_t n) const {
+     return lb.v_gpu_fmt && lb.v_gpu_tokens >= n;
+ }
+ 
++bool RawKvStore::has_mean(uint32_t block_id, uint32_t il, uint32_t n) const {
++    std::lock_guard<std::mutex> lk(mu_);
++    if (block_id >= blocks_.size() || il >= cfg_.n_layer) {
++        return false;
++    }
++    const LayerBlk & lb = blocks_[block_id].layers[il];
++    return lb.mean_tokens >= n && lb.k_sum.size() == cfg_.n_embd_k;
++}
++
+ uint32_t RawKvStore::n_tokens(uint32_t block_id) const {
+     std::lock_guard<std::mutex> lk(mu_);
+     if (block_id >= blocks_.size()) {
+diff --git a/scripts/windows/build.ps1 b/scripts/windows/build.ps1
+index dff9cce..285d19e 100755
+--- a/scripts/windows/build.ps1
++++ b/scripts/windows/build.ps1
+@@ -7,7 +7,8 @@ param(
+     [string]$CudaArchitectures = '75-real;80-real;86-real;89-real;90-real;120a-real',
+     [ValidateRange(1, 64)][int]$Jobs = 4,
+     [switch]$HostOnly,
+-    [switch]$BuildOnly
++    [switch]$BuildOnly,
++    [switch]$SkipPatch
+ )
+ $ErrorActionPreference = 'Stop'
+ Set-StrictMode -Version Latest
+@@ -32,7 +33,7 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
+ }
+ foreach ($tool in 'cmake', 'ninja', 'cl') { $null = Get-Command $tool -ErrorAction Stop }
+ 
+-if (!$HostOnly) {
++if (!$HostOnly -and !$SkipPatch) {
+     # Use the maintained patch, never the developer's unrecorded submodule edits.
+     $llama = Join-Path $SourceDir 'llama.cpp'
+     $patch = Join-Path $SourceDir 'patches/llama-kvmem-current.patch'
+@@ -78,11 +79,11 @@ $targets = @('kvmem_store_test', 'pinned_kv_tier_test', 'nvme_disabled_test', 'k
+ if (!$HostOnly) {
+     $targets += @('llama-kvmem-server', 'llama-kvmem-cli', 'llama-quantize',
+         'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test', 'kvmem-server-options-test',
+-        'kvmem-server-progress-test', 'kvmem-output-limit-test')
++        'kvmem-server-progress-test', 'kvmem-output-limit-test', 'kvmem-mtp-kv-test', 'kvmem-gdn-replay-test')
+ }
+ Invoke-Checked cmake (@('--build', $BuildDir, '--parallel', "$Jobs", '--target') + $targets)
+ if (!$BuildOnly) {
+     Invoke-Checked ctest @('--test-dir', $BuildDir, '--output-on-failure', '-R',
+-        '^(kvmem_store_test|pinned_kv_tier_test|nvme_disabled_test|kvmem_runtime_test|raw_kv_store_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test)$')
++        '^(kvmem_store_test|pinned_kv_tier_test|nvme_disabled_test|kvmem_runtime_test|raw_kv_store_test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test|kvmem-mtp-kv-test|kvmem-gdn-replay-test)$')
+     Write-Host "Built and tested: $BuildDir"
+ } else { Write-Host "Built only; runtime tests NOT run: $BuildDir" }
+diff --git a/src/adapter/llama-memory-kvmem.cpp b/src/adapter/llama-memory-kvmem.cpp
+index 9cc2456..641ff61 100644
+--- a/src/adapter/llama-memory-kvmem.cpp
++++ b/src/adapter/llama-memory-kvmem.cpp
+@@ -454,6 +454,13 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
+         }
+         return new llama_memory_kvmem_mtp(model, params, cparams, tgt);
+     }
++    if (model.arch == LLM_ARCH_DFLASH) {
++        // DFlash draft contexts use their own plain KV cache. KVMem remaps the
++        // target's physical slots, so independently paging the draft would
++        // desynchronize its position-keyed state.
++        LLAMA_LOG_INFO("%s: KVMem leaves the DFlash draft on a plain KV cache\n", __func__);
++        return nullptr;
++    }
+     if (llm_arch_is_recurrent(model.arch)) {
+         LLAMA_LOG_WARN("%s: KVMem skips purely recurrent arch %s\n",
+                 __func__, llm_arch_name(model.arch));
+@@ -482,6 +489,8 @@ llama_memory_kvmem::llama_memory_kvmem(
+     model_(model) {
+     backend_.owner = this;
+     trace_ = kvmem_diag_enabled();
++    const char * lazy_mean = getenv("KVMEM_LAZY_DECODE_MEAN");
++    lazy_decode_mean_ = lazy_mean && lazy_mean[0] != '\0' && lazy_mean[0] != '0';
+     perf_.enabled = kvmem_env_perf();
+     retr_.enabled = perf_.enabled;
+     harvest_perf_emit_graph_line();
+@@ -785,6 +794,11 @@ void llama_memory_kvmem::trace_plan(const char * tag, const kvmem::KvMemPlan & p
+ void llama_memory_kvmem::apply_plan_to_kv(const kvmem::KvMemPlan & plan) {
+     if (!plan.stage_in.empty() || !plan.stage_out.empty()) ++attention_epoch_;
+     auto & store = runtime_->store();
++    if (lazy_decode_mean_) {
++        for (uint32_t id : plan.stage_out) {
++            materialize_block_mean(id);
++        }
++    }
+     for (uint32_t id : plan.stage_out) {
+         if (id == decode_mean_block_) {
+             decode_mean_flush();
+@@ -2494,6 +2508,33 @@ void llama_memory_kvmem::decode_mean_print_sum() {
+             decode_mean_stats_.last_rms);
+ }
+ 
++void llama_memory_kvmem::materialize_block_mean(uint32_t block_id) {
++    if (!lazy_decode_mean_ || !raw_ || !runtime_) {
++        return;
++    }
++    const auto & blocks = runtime_->store().blocks();
++    if (block_id >= blocks.size()) {
++        return;
++    }
++    const auto & block = blocks[block_id];
++    if (block.gpu_slot < 0 || block.n_tokens == 0) {
++        return;
++    }
++    std::vector<float> keys;
++    for (uint32_t il = 0; il < n_layer_; ++il) {
++        if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il)) ||
++                raw_->has_mean(block_id, il, block.n_tokens)) {
++            continue;
++        }
++        if (read_gpu_block(block_id, il, true, keys)) {
++            raw_->write_layer_mean_k(block.orig_pos_start, block.n_tokens, il, keys.data());
++        }
++    }
++    if (trace_) {
++        kvmem_diag("KVMEM_TRACE lazy_mean block=%u n=%u\n", block_id, block.n_tokens);
++    }
++}
++
+ bool llama_memory_kvmem::decode_mean_add_host_layer(ggml_tensor * t, int il,
+                                                    uint32_t tok0, uint32_t n_add) {
+     if (!t || il < 0 || static_cast<uint32_t>(il) >= n_layer_ || n_add == 0) {
+@@ -3051,6 +3092,13 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval() {
+     retr_ = RetrPerf{};
+     retr_.enabled = enabled;
+     harvest_flush();
++    if (lazy_decode_mean_) {
++        for (const auto & block : runtime_->store().blocks()) {
++            if (block.gpu_slot >= 0 && block.n_tokens > 0) {
++                materialize_block_mean(block.block_id);
++            }
++        }
++    }
+     const int64_t t1 = ggml_time_us();
+     if (method_ == 1) score_retrieval();
+     const int64_t t2 = ggml_time_us();
+@@ -3741,9 +3789,17 @@ llama_pos llama_kvmem_model_pos(uint32_t logical) {
+ }
+ 
+ bool llama_kvmem_remove_logical(llama_context * ctx, llama_pos begin, llama_pos end) {
++    auto * native = llama_get_memory(ctx);
++    if (native &&
++            dynamic_cast<llama_memory_kvmem *>(native) == nullptr &&
++            dynamic_cast<llama_memory_kvmem_hybrid *>(native) == nullptr &&
++            dynamic_cast<llama_memory_kvmem_mtp *>(native) == nullptr) {
++        // DFlash draft context: truncate its own plain cache rather than the
++        // currently active target KVMem slot pool.
++        return llama_memory_seq_rm(native, 0, begin, end);
++    }
+     auto * mem = kvmem_capture_active();
+     if (mem) return mem->remove_logical(ctx, begin, end);
+-    auto * native = llama_get_memory(ctx);
+     auto * hybrid = dynamic_cast<llama_memory_hybrid *>(native);
+     auto * kv = hybrid ? hybrid->get_mem_attn() : dynamic_cast<llama_kv_cache *>(native);
+     if (!kv) return llama_memory_seq_rm(native, 0, begin, end);
+diff --git a/src/adapter/llama-memory-kvmem.h b/src/adapter/llama-memory-kvmem.h
+index ec7be62..cf40e1c 100644
+--- a/src/adapter/llama-memory-kvmem.h
++++ b/src/adapter/llama-memory-kvmem.h
+@@ -130,7 +130,7 @@ public:
+             (explicit_spans_ ? !turn_spans_.query.empty() : query_begin_ >= 0);
+     }
+     bool want_decode_mean() const {
+-        return retrieval_pinned_ && method_ == 1 && !replay_;
++        return !lazy_decode_mean_ && retrieval_pinned_ && method_ == 1 && !replay_;
+     }
+     void end_prefill_capture() { prefill_capture_ = false; }
+     // Next request continues this sequence: flush decode mean, unpin
+@@ -222,6 +222,7 @@ private:
+     void decode_mean_zero_acc();
+     bool decode_mean_add_host_layer(struct ggml_tensor * t, int il, uint32_t tok0, uint32_t n_add);
+     void decode_mean_print_sum();
++    void materialize_block_mean(uint32_t block_id);
+     struct HarvestVJob {
+         uint32_t pos0 = 0;
+         uint32_t n = 0;
+@@ -336,6 +337,7 @@ private:
+     uint32_t kv_size_ = 0;
+     uint32_t n_slots_ = 0;
+     bool trace_ = false;
++    bool lazy_decode_mean_ = false;
+ 
+     std::unique_ptr<llama_kv_cache> kv_owned_;
+     llama_kv_cache * kv_ = nullptr;
+diff --git a/tools/kvmem-multimodal-server.h b/tools/kvmem-multimodal-server.h
+index 8b64c56..876a26d 100644
+--- a/tools/kvmem-multimodal-server.h
++++ b/tools/kvmem-multimodal-server.h
+@@ -52,7 +52,11 @@ static MultimodalCheckpoint multimodal_checkpoint(ServerState & st, int row) {
+     }
+     {
+         kvmem_scoped_ms carry_timer(st.mm_perf.carry_ms);
+-        if (st.spec.ok && !common_speculative_get_state(st.spec.spec, 0, data->draft_carry)) {
++        // MTP keeps a carry cursor (synced rows + pending hidden) that must be stored
++        // with the checkpoint. DFlash has no such cursor: its draft KV is written
++        // row-by-row at the target's positions in process() and truncated through
++        // llama_kvmem_remove_logical() on restore, so nothing needs to be carried here.
++        if (st.spec.ok && !st.spec_dflash && !common_speculative_get_state(st.spec.spec, 0, data->draft_carry)) {
+             throw std::runtime_error("MTP carry checkpoint failed");
+         }
+     }
+@@ -100,7 +104,7 @@ static void multimodal_restore(ServerState & st, const MultimodalCheckpoint & ch
+     if (st.spec.ctx_dft && !llama_kvmem_remove_logical(st.spec.ctx_dft, checkpoint.row, -1)) {
+         throw std::runtime_error("cannot remove uncommitted MTP rows");
+     }
+-    if (st.spec.ok && !live) {
++    if (st.spec.ok && !st.spec_dflash && !live) {
+         kvmem_scoped_ms carry_timer(st.mm_perf.carry_ms);
+         common_speculative_set_state(st.spec.spec, 0, checkpoint.data->draft_carry);
+     }
+@@ -112,25 +116,43 @@ static void multimodal_restore(ServerState & st, const MultimodalCheckpoint & ch
+     st.mm_live_checkpoint = checkpoint.data;
+ }
+ 
+-static void multimodal_finish_request(ServerState & st) {
++static void multimodal_finish_request(ServerState & st, bool preserve_progress = false) {
+     if (st.mm_committed || !st.mm_rollback) return;
+     try {
+         llama_kvmem_set_replay(false);
+-        multimodal_restore(st, *st.mm_rollback, true);
++        // An interrupted request must not throw away the rows it already evaluated.
++        // Only a confirmed client cancellation (preserve_progress) may resume from
++        // mm_resume; real failures (decode/retrieval/checkpoint errors, HTTP 400)
++        // still roll all the way back to the request's base checkpoint so a broken
++        // request can never become the base of the next one.
++        const MultimodalCheckpoint * target = st.mm_rollback.get();
++        if (preserve_progress && st.mm_resume.data &&
++                st.mm_resume.row > target->row && st.mm_resume.row <= st.mm_live_row) {
++            target = &st.mm_resume;
++        }
++        // The rollback truncates the KV to the rollback row, so an anchor past it
++        // would claim recurrent state that no longer matches the resident rows.
++        const bool keep_anchor = st.mm_anchor.data && st.mm_anchor.row <= target->row;
++        multimodal_restore(st, *target, true);
+         llama_kvmem_begin_cached_turn();
++        if (!keep_anchor) st.mm_anchor = MultimodalCheckpoint{};
+         st.mm_query.reset();
+         st.mm_pending_query.reset();
+-        st.cached_prompt = st.mm_rollback_prompt;
++        st.cached_prompt = st.active_prompt ? st.active_prompt->prefix(target->row) : nullptr;
+         st.cached_tokens = st.cached_prompt ? st.cached_prompt->tokens : std::vector<llama_token>{};
+         st.cached_tokens.resize(std::min(st.cached_tokens.size(), (size_t) st.mm_live_row));
+-        multimodal_remember(st, *st.mm_rollback);
+-        kvmem_diag("KVMEM_TRACE multimodal_rollback context=%p row=%d\n", (void *) st.ctx, st.mm_live_row);
++        multimodal_remember(st, *target);
++        kvmem_diag("KVMEM_TRACE multimodal_rollback context=%p row=%d kept_anchor=%d resumed=%d\n",
++                (void *) st.ctx, st.mm_live_row, (int) keep_anchor, (int) (target == &st.mm_resume));
+         kvmem_diag("KVMEM_CHECKPOINT_ROLLBACK live_bytes=%zu peak_bytes=%zu\n",
+                 st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
+         st.mm_committed = true;
+     } catch (const std::exception & e) {
+         st.mm_error = e.what();
+         LOG_ERR("srv    KVMEM_TRACE multimodal_rollback_failed error=%s\n", e.what());
++        // Fail closed: a failed rollback can leave rows and recurrent state from
++        // different points, so never let the next request build on it.
++        memory_clear_all(st);
+     }
+     st.mm_rollback.reset();
+     st.mm_rollback_prompt.reset();
+@@ -139,7 +161,7 @@ static void multimodal_finish_request(ServerState & st) {
+ static int multimodal_decode_span(ServerState & st, int begin, int end, bool replay, StreamIo * io) {
+     const auto & prompt = *st.active_prompt;
+     auto dispatch = [&](llama_batch batch) -> int {
+-        if (!stream_heartbeat(io)) return KVMEM_DECODE_ABORT;
++        if (!stream_heartbeat(io)) { st.mm_client_abort = true; return KVMEM_DECODE_ABORT; }
+         kvmem_diag("KVMEM_TRACE multimodal_decode context=%p rows=[%d,%d) model_pos=%d image=%d replay=%d\n",
+                 (void *) st.ctx, batch.logical_pos[0], batch.logical_pos[batch.n_tokens - 1] + 1,
+                 batch.pos[0], batch.token == nullptr, replay);
+@@ -152,8 +174,9 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
+             st.mm_perf.target_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+         }
+         const auto draft_start = std::chrono::steady_clock::now();
+-        if (rc == 0 && st.spec.ok && !common_speculative_process(st.spec.spec, batch)) rc = -1;
+-        if (diagnostic && st.spec.ok) {
++        if (rc == 0 && st.spec.ok && st.turn_spec_enabled &&
++                !common_speculative_process(st.spec.spec, batch)) rc = -1;
++        if (diagnostic && st.spec.ok && st.turn_spec_enabled) {
+             llama_synchronize(st.spec.ctx_dft);
+             st.mm_perf.draft_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - draft_start).count();
+         }
+@@ -165,6 +188,17 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
+                 batch.token == nullptr, replay);
+         if (rc == 0) {
+             st.mm_live_row = batch.logical_pos[batch.n_tokens - 1] + 1;
++            if (!replay && st.mm_resume_max_row > 0 && st.mm_live_row <= st.mm_resume_max_row &&
++                    (st.mm_resume_row < 0 ||
++                     st.mm_live_row - st.mm_resume_row >= st.mm_resume_interval)) {
++                // Interrupt resume point: the recurrent state of a completed first-pass
++                // batch. Resuming here is what lets a cancelled request continue instead
++                // of re-evaluating a cold 17K prefill in full. A snapshot costs ~157 MB
++                // of D2H traffic, so after the first batch it runs on a row interval
++                // (KVMEM_RESUME_INTERVAL, default 2048 rows ~ 4 s of prefill).
++                st.mm_resume = multimodal_checkpoint(st, st.mm_live_row);
++                st.mm_resume_row = st.mm_live_row;
++            }
+             if (replay) st.mm_replayed += batch.n_tokens;
+             else {
+                 const int tail = std::clamp(st.mm_lcp - batch.logical_pos[0], 0, batch.n_tokens);
+@@ -180,7 +214,7 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
+     };
+     int row = begin;
+     while (row < end) {
+-        if (!stream_heartbeat(io)) return KVMEM_DECODE_ABORT;
++        if (!stream_heartbeat(io)) { st.mm_client_abort = true; return KVMEM_DECODE_ABORT; }
+         if (prompt.tokens[row] == LLAMA_TOKEN_NULL) {
+             const int next = (int) prompt.media_end(row);
+             if (next > end) throw std::runtime_error("prefill boundary splits an image");
+@@ -210,7 +244,7 @@ static int multimodal_decode_span(ServerState & st, int begin, int end, bool rep
+         llama_seq_id seq = 0;
+         std::vector<llama_seq_id *> seq_ids(next - row, &seq);
+         std::vector<int8_t> outputs(next - row, 0);
+-        outputs.back() = !st.spec.ok;
++        outputs.back() = !st.turn_spec_enabled;
+         batch.n_seq_id = n_seq.data();
+         batch.seq_id = seq_ids.data();
+         batch.logits = outputs.data();
+@@ -238,12 +272,12 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+         st.mm_new_text = st.mm_new_image = st.mm_replayed = st.mm_tail_replayed = 0;
+         if (st.vision) st.vision->reset_stats();
+         const auto & prompt = *st.active_prompt;
+-        const int eval_end = (int) prompt.tokens.size() - (st.spec.ok ? 1 : 0);
++        const int eval_end = (int) prompt.tokens.size() - (st.turn_spec_enabled ? 1 : 0);
+         const int lcp = st.cached_prompt ? (int) prompt.common_prefix(*st.cached_prompt) : 0;
+         st.mm_lcp = lcp;
+         // Sequence checkpoints do not restore logits. Ordinary decoding must evaluate
+-        // at least one token; MTP evaluates the pending prompt token in spec_generate.
+-        const int keep = std::min({lcp, st.mm_live_row, eval_end - (st.spec.ok ? 0 : 1)});
++        // at least one token; speculative generation evaluates the pending prompt token.
++        const int keep = std::min({lcp, st.mm_live_row, eval_end - (st.turn_spec_enabled ? 0 : 1)});
+         MultimodalCheckpoint base;
+         bool found = false;
+         {
+@@ -254,6 +288,17 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+                     found = true;
+                 }
+             }
++            // Generation-start anchor left by the previous request. It is the
++            // only checkpoint that can still be <= keep when the client
++            // re-templates the previous answer (thinking stripped, tail
++            // truncated) instead of resending it byte-identically: that moves
++            // lcp below the post-generation snapshot's row, and without a
++            // checkpoint at or below lcp the whole history is discarded.
++            if (st.mm_anchor.data && st.mm_anchor.row <= keep &&
++                    (!found || st.mm_anchor.row > base.row)) {
++                base = st.mm_anchor;
++                found = true;
++            }
+         }
+         if (!found) {
+             // Shared template tokens do not identify a conversation. Like llama-server,
+@@ -269,6 +314,15 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+         st.mm_rollback = std::make_shared<MultimodalCheckpoint>(base);
+         st.mm_rollback_prompt = st.cached_prompt ? st.cached_prompt->prefix(base.row) : nullptr;
+         st.mm_committed = false;
++        // Per-request interrupt-resume bookkeeping (see multimodal_finish_request).
++        // Set AFTER the miss branch: memory_clear_all() resets these fields, and a
++        // cold/missed request is exactly the one we want to be able to resume.
++        // mm_resume_max_row is the highest row a later request could still select,
++        // so snapshots at or above it would never be used.
++        st.mm_resume = MultimodalCheckpoint{};
++        st.mm_resume_row = -1;
++        st.mm_client_abort = false;
++        st.mm_resume_max_row = eval_end - (st.turn_spec_enabled ? 0 : 1);
+         multimodal_restore(st, base, true);
+         llama_kvmem_begin_cached_turn();
+         std::vector<uint32_t> starts, ends;
+@@ -355,14 +409,28 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+             all_resident = !reused_query && retrieve && st.query_replay_auto &&
+                 llama_kvmem_can_append(eval_end, st.turn_generation_rows, true, reason);
+         }
+-        if (all_resident) llama_kvmem_keep_selected();
++        if (all_resident) {
++            // The complete history already fits on GPU.  Retrieval scoring cannot
++            // change the resident set, so skip Q capture for this turn while still
++            // harvesting raw-K blocks needed if a later turn crosses the budget.
++            llama_kvmem_keep_selected();
++            llama_kvmem_freeze_query(true);
++            fprintf(stderr, "KVMEM_TRACE resident_fast_path q_capture=0\n");
++        }
+         if (st.query_policy_user && retrieve && !reused_query && !all_resident) {
+             multimodal_validate_capacity(st, prompt, query, eval_end);
+         }
+         if (n_cache_hit) *n_cache_hit = base.row;
+         if (multimodal_decode_span(st, base.row, query, false, io) != 0) throw std::runtime_error("multimodal prefill failed or cancelled");
+-        auto query_checkpoint = multimodal_checkpoint(st, query);
+-        multimodal_remember(st, query_checkpoint);
++        // A query checkpoint is needed only when the post-query attention view may
++        // force a replay.  Resident and cached-query paths commit in place, so
++        // serializing the fixed recurrent state here is pure overhead.
++        MultimodalCheckpoint query_checkpoint;
++        const bool may_replay_query = retrieve && !reused_query && !all_resident;
++        if (may_replay_query) {
++            query_checkpoint = multimodal_checkpoint(st, query);
++            multimodal_remember(st, query_checkpoint);
++        }
+         const auto probe_view = llama_kvmem_get_attention_view();
+         if (multimodal_decode_span(st, query, eval_end, false, io) != 0) throw std::runtime_error("multimodal query prefill failed or cancelled");
+         if (reused_query) {
+@@ -371,7 +439,10 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+             bool replay = true;
+             {
+                 kvmem_scoped_ms timer(st.mm_perf.retrieval_ms);
+-                if (all_resident && llama_kvmem_commit_resident()) {
++                if (all_resident) {
++                    if (!llama_kvmem_commit_resident()) {
++                        throw std::runtime_error("resident preflight succeeded but commit failed");
++                    }
+                     path = "all_resident";
+                     replay = false;
+                 } else {
+@@ -399,6 +470,10 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+                         query, eval_end, eval_end - query, st.kparams.budget);
+             }
+             if (replay) {
++                // The selection that just got applied rewires the resident rows, so a
++                // first-pass resume point no longer describes the current KV layout.
++                st.mm_resume = MultimodalCheckpoint{};
++                st.mm_resume_row = -1;
+                 multimodal_restore(st, query_checkpoint, false);
+                 llama_kvmem_set_replay(true);
+                 const int rc = multimodal_decode_span(st, query, eval_end, true, io);
+@@ -428,14 +503,39 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+                 path.c_str(), reason.c_str(), reuse_fallback.c_str(), base.row, eval_end, query, eval_end,
+                 spans.query.front().begin, spans.query.back().end, source, reused_query, q_rows, st.mm_replayed, st.mm_perf.decision_ms);
+         llama_kvmem_pin_working_set();
+-        multimodal_remember(st, multimodal_checkpoint(st, eval_end));
++        // Cross-request anchor: the reusable state for the next request is the
++        // Preserve the previous turn's generation-start checkpoint before
++        // advancing the anchor. A mid-generation interjection can alter the
++        // current final user message, making its LCP a few tokens shorter than
++        // this turn's eval_end; the previous anchor is then the newest valid
++        // recurrent checkpoint. Without it, the resumed eval_end checkpoint is
++        // above keep and the next request falls back to a cold load.
++        if (eval_end > 0) {
++            if (st.mm_anchor.data && st.mm_anchor.row < eval_end) {
++                multimodal_remember(st, st.mm_anchor);
++            }
++            // Refresh unconditionally: equal row does not imply equal content.
++            st.mm_anchor = multimodal_checkpoint(st, eval_end);
++        }
++        // A generation cancelled after a completed prefill can resume from the end of
++        // this prefill (shares the anchor's snapshot when the rows match).
++        if (eval_end > 0 && eval_end <= st.mm_resume_max_row && eval_end != st.mm_resume_row) {
++            st.mm_resume = st.mm_anchor;
++            st.mm_resume_row = eval_end;
++        }
++        st.mm_live_checkpoint.reset();
+         std::vector<uint8_t> carry;
+         llama_pos synced = 0;
+-        if (st.spec.ok) {
++        if (st.turn_spec_enabled) {
+             common_speculative_get_state(st.spec.spec, 0, carry);
+-            if (carry.size() < sizeof(synced)) throw std::runtime_error("MTP carry missing");
+-            std::memcpy(&synced, carry.data(), sizeof(synced));
+-            if (synced != eval_end) throw std::runtime_error("MTP has unsynchronized visual rows");
++            if (st.spec_mtp) {
++                // MTP-specific invariant: the MTP head shares the target KV, so its
++                // synced-row cursor must land exactly on the evaluated rows. DFlash
++                // drafts are position-keyed instead, so the check does not apply.
++                if (carry.size() < sizeof(synced)) throw std::runtime_error("MTP carry missing");
++                std::memcpy(&synced, carry.data(), sizeof(synced));
++                if (synced != eval_end) throw std::runtime_error("MTP has unsynchronized visual rows");
++            }
+         }
+         kvmem_diag("KVMEM_TRACE multimodal_prefill context=%p prefix_hit_rows=%d lcp=%d new_text_rows=%u new_image_rows=%u replayed_rows=%u vision_encode_calls=%u encoder_ms=%.2f logical_cursor=%d model_cursor=%d mtp_synced_rows=%d cached_tail_rows=%u replay_reason=%s embedding_cache_bytes=%zu checkpoint_bytes=%zu\n",
+                 (void *) st.ctx, base.row, lcp, st.mm_new_text, st.mm_new_image, st.mm_replayed,
+@@ -457,6 +557,8 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+         if (st.mm_rollback) count(*st.mm_rollback);
+         count(base);
+         count(query_checkpoint);
++        count(st.mm_anchor);
++        count(st.mm_resume);
+         const auto & p = st.mm_perf;
+         kvmem_diag("KVMEM_PREFILL_PERF total_ms=%.3f first_ms=%.3f replay_ms=%.3f retrieval_ms=%.3f checkpoint_select_ms=%.3f checkpoint_save_ms=%.3f checkpoint_restore_ms=%.3f mean_nested_ms=%.3f carry_nested_ms=%.3f saves=%u restores=%u shared=%u restore_skips=%u checkpoint_unique_bytes=%zu\n",
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-started).count(),
+@@ -480,7 +582,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
+         st.mm_error = e.what();
+         if (dynamic_cast<const std::invalid_argument *>(&e)) st.mm_error_status = 400;
+         LOG_ERR("srv    KVMEM_TRACE multimodal_error error=%s\n", e.what());
+-        multimodal_finish_request(st);
++        multimodal_finish_request(st, st.mm_client_abort);
+         return false;
+     }
+ }
+@@ -495,6 +597,9 @@ static void multimodal_commit(ServerState & st, const std::vector<llama_token> &
+     st.mm_committed = true;
+     st.mm_rollback.reset();
+     st.mm_rollback_prompt.reset();
++    // The turn is complete; a later abort must not resume into the previous turn.
++    st.mm_resume = MultimodalCheckpoint{};
++    st.mm_resume_row = -1;
+     kvmem_diag("KVMEM_CHECKPOINT_COMMIT live_bytes=%zu peak_bytes=%zu\n",
+             st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
+ }
+diff --git a/tools/kvmem-spec.cpp b/tools/kvmem-spec.cpp
+index 196e6dd..680ca94 100644
+--- a/tools/kvmem-spec.cpp
++++ b/tools/kvmem-spec.cpp
+@@ -74,12 +74,25 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
+ 
+     common_init();
+ 
++    if (opts.dflash && opts.draft_model.empty()) {
++        fprintf(stderr, "kvmem_spec_start: --spec-type draft-dflash requires --spec-draft-model\n");
++        return false;
++    }
++
+     common_params p;
+-    p.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
++    p.speculative.types.clear();
++    if (opts.ngram_mod) {
++        p.speculative.types.push_back(COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
++    }
++    p.speculative.types.push_back(opts.dflash ? COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH
++                                             : COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
+     p.speculative.draft.n_max = opts.n_max;
+     p.speculative.draft.n_min = opts.n_min;
+     p.speculative.draft.p_min = opts.p_min;
+     p.speculative.draft.n_gpu_layers = opts.n_gpu_layers;
++    if (opts.n_ctx_draft > 0) {
++        p.speculative.draft.n_ctx = opts.n_ctx_draft;
++    }
+     if (!opts.draft_model.empty()) {
+         p.speculative.draft.mparams.path = opts.draft_model;
+     }
+@@ -91,7 +104,8 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
+     if (opts.n_threads > 0) p.cpuparams.n_threads = opts.n_threads;
+     if (opts.n_threads_batch > 0) p.cpuparams_batch.n_threads = opts.n_threads_batch;
+     p.flash_attn_type = opts.flash_attn;
+-    p.n_outputs_max = 1 + std::max(0, opts.n_max);
++    const int32_t n_spec_max = std::max(opts.n_max, opts.ngram_mod ? p.speculative.ngram_mod.n_max : 0);
++    p.n_outputs_max = 1 + std::max(0, n_spec_max);
+     p.n_outputs_max_per_seq = p.n_outputs_max;
+     p.cache_type_k = opts.type_k;
+     p.cache_type_v = opts.type_v;
+@@ -103,9 +117,9 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
+     sess.init = common_speculative_init_from_params(p_dft, model_tgt, ctx_tgt);
+     sess.ctx_dft = sess.init ? sess.init->context() : nullptr;
+     if (!sess.ctx_dft) {
+-        fprintf(stderr,
+-                "kvmem_spec_start: MTP draft context is null "
+-                "(GGUF missing nextn / qwen35.nextn_predict_layers?)\n");
++        fprintf(stderr, "kvmem_spec_start: %s draft context is null%s\n",
++                opts.dflash ? "DFlash" : "MTP",
++                opts.dflash ? "" : " (GGUF missing nextn / qwen35.nextn_predict_layers?)");
+         return false;
+     }
+ 
+@@ -151,8 +165,11 @@ bool kvmem_spec_start(kvmem_spec_session & sess,
+     }
+ 
+     sess.ok = true;
+-    kvmem_diag("KVMEM_TRACE spec_start type=draft-mtp n_max=%d p_min=%.3f dft=%p\n",
+-            opts.n_max, opts.p_min, (void *) sess.ctx_dft);
++    kvmem_diag("KVMEM_TRACE spec_start type=%s%s n_max=%d ngram_max=%d p_min=%.3f dft=%p\n",
++            opts.dflash ? "draft-dflash" : "draft-mtp",
++            opts.ngram_mod ? ",ngram-mod" : "",
++            opts.n_max, opts.ngram_mod ? p.speculative.ngram_mod.n_max : 0,
++            opts.p_min, (void *) sess.ctx_dft);
+     return true;
+ }
+ 
+@@ -283,6 +300,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
+     std::vector<uint8_t> driver_ckpt;
+     common_prompt_checkpoint ckpt;
+     bool has_eos = false;
++    common_speculative_type draft_type = COMMON_SPECULATIVE_TYPE_NONE;
+     int64_t verify_us = 0, fold_us = 0;
+     uint64_t verify_calls = 0, committed_rows = 0;
+ 
+@@ -317,6 +335,7 @@ kvmem_spec_gen_stats kvmem_spec_generate(
+                 /* .n_past_logical = */ n_past,
+             };
+             common_speculative_draft(spec);
++            draft_type = common_speculative_last_type(spec, seq_id);
+ 
+             const bool host_ckpt = sess.use_ckpt_tgt
+                     || (sess.n_rs_tgt > 0 && draft.size() > sess.n_rs_tgt);
+@@ -377,16 +396,13 @@ kvmem_spec_gen_stats kvmem_spec_generate(
+         auto ids = common_sampler_sample_and_accept_n(smpl.get(), ctx_tgt, draft);
+         verify_us += ggml_time_us() - verify_start;
+         ++verify_calls;
+-        ids.resize(std::min(ids.size(), (size_t) (n_predict - st.n_gen)));
+-        for (size_t i = 0; i < ids.size(); ++i) {
+-            if (llama_vocab_is_eog(vocab, ids[i])) {
+-                ids.resize(i + 1);
+-                break;
+-            }
+-        }
++
++        // Rollback is determined from the complete verifier result. Output
++        // limits and EOG are generation boundaries, not draft mismatches.
+         const bool restore = host_ckpt && !ids.empty() && ids.size() - 1 < n_draft;
+-        kvmem_diag("KVMEM_TRACE spec_verify n_draft=%zu n_accept=%zu restore=%d pos=%d ckpt_bytes=%zu n_rs=%u\n",
+-                n_draft, ids.size() > 0 ? ids.size() - 1 : 0, (int) restore, n_past - 1,
++        kvmem_diag("KVMEM_TRACE spec_verify driver=%s n_draft=%zu n_accept=%zu restore=%d pos=%d ckpt_bytes=%zu n_rs=%u\n",
++                common_speculative_type_to_str(draft_type).c_str(), n_draft,
++                ids.size() > 0 ? ids.size() - 1 : 0, (int) restore, n_past - 1,
+                 ckpt.data_tgt.size(), sess.n_rs_tgt);
+ 
+         if (restore) {
+@@ -413,6 +429,14 @@ kvmem_spec_gen_stats kvmem_spec_generate(
+             continue;
+         }
+ 
++        ids.resize(std::min(ids.size(), (size_t) (n_predict - st.n_gen)));
++        for (size_t i = 0; i < ids.size(); ++i) {
++            if (llama_vocab_is_eog(vocab, ids[i])) {
++                ids.resize(i + 1);
++                break;
++            }
++        }
++
+         if (ids.empty() || (sess.use_gdn_replay && abort && abort())) {
+             if (sess.use_gdn_replay) {
+                 if (!transaction.commit(0)) st.failed = true;
+diff --git a/tools/kvmem-spec.h b/tools/kvmem-spec.h
+index 302b5f0..41483e8 100644
+--- a/tools/kvmem-spec.h
++++ b/tools/kvmem-spec.h
+@@ -24,6 +24,9 @@ struct kvmem_spec_opts {
+     int32_t n_threads_batch = -1;
+     llama_flash_attn_type flash_attn = LLAMA_FLASH_ATTN_TYPE_AUTO;
+     bool    kvmem_enabled = false;
++    bool    dflash = false;   // DRAFT_DFLASH + sidecar draft model, instead of welded-nextn MTP
++    bool    ngram_mod = false; // run ngram-mod before the neural drafter (llama.cpp priority order)
++    int32_t n_ctx_draft = 0;  // draft context size; 0 = follow the target context
+     std::string draft_model; // optional sidecar GGUF; empty = welded nextn
+     ggml_type type_k = GGML_TYPE_Q8_0;
+     ggml_type type_v = GGML_TYPE_Q8_0;
+diff --git a/tools/llama-kvmem-server.cpp b/tools/llama-kvmem-server.cpp
+index 75122ac..17b4063 100644
+--- a/tools/llama-kvmem-server.cpp
++++ b/tools/llama-kvmem-server.cpp
+@@ -125,7 +125,8 @@ static void print_usage(const char * argv0) {
+             "  --kv-dtype NAME            GPU KV cache type for K and V: f16 | f32 | q8_0 | q5_0 | q4_0 (default q8_0)\n"
+             "  -ctk, --cache-type-k TYPE  GPU K cache type (llama.cpp name; default q8_0)\n"
+             "  -ctv, --cache-type-v TYPE  GPU V cache type (quantized: independently q8_0 | q5_0 | q4_0)\n"
+-            "  --spec-type TYPE           none | draft-mtp (default none)\n"
++            "  --spec-type TYPE           none | draft-mtp | draft-dflash, optionally +ngram-mod\n"
++            "  --spec-draft-model PATH    sidecar draft GGUF (required by draft-dflash)\n"
+             "  --spec-kv-dtype TYPE       MTP K/V type (default f16)\n"
+             "  --spec-draft-n-max N       MTP draft tokens (default 3)\n"
+             "  --spec-draft-p-min P       min draft probability (default 0)\n"
+@@ -179,6 +180,16 @@ static int force_pos_from_substr(const llama_vocab * vocab, const std::vector<ll
+     return -1;
+ }
+ 
++// Rows between interrupt-resume snapshots (KVMEM_RESUME_INTERVAL; 0 = every batch).
++// One snapshot is ~157 MB on this model, so the default trades a little resume
++// granularity for a lot less D2H traffic during prefill.
++static int kvmem_resume_interval_default() {
++    const char * v = std::getenv("KVMEM_RESUME_INTERVAL");
++    if (!v || !*v) return 2048;
++    const int n = std::atoi(v);
++    return n < 0 ? 0 : n;
++}
++
+ struct MultimodalCheckpointAccounting {
+     size_t live_bytes = 0;
+     size_t peak_bytes = 0;
+@@ -228,12 +239,16 @@ struct ServerState {
+     bool query_policy_user = true;
+     uint32_t turn_generation_rows = 0;
+     bool turn_query_exact = false;
++    bool turn_spec_enabled = true;
+     std::string model_name = "kvmem";
+     kvmem_spec_session spec;
+     ggml_type cache_type_k = GGML_TYPE_Q8_0;
+     ggml_type cache_type_v = GGML_TYPE_Q8_0;
+     ggml_type spec_cache_type = GGML_TYPE_F16;
+     bool spec_mtp = false;
++    bool spec_dflash = false;
++    bool spec_ngram_mod = false;
++    std::string spec_draft_model;
+     int spec_n_max = 3;
+     float spec_p_min = 0.0f;
+     bool enable_thinking_default = false;
+@@ -245,6 +260,19 @@ struct ServerState {
+     std::shared_ptr<kvmem_prompt> active_prompt;
+     std::shared_ptr<kvmem_prompt> cached_prompt;
+     std::vector<MultimodalCheckpoint> mm_checkpoints;
++    // Generation-start anchor carried across requests: the next request may
++    // only share a prefix shorter than the post-generation snapshot's row.
++    MultimodalCheckpoint mm_anchor;
++    // Interrupt resume point: the recurrent snapshot of a completed first-pass batch of
++    // the request in flight. multimodal_finish_request() uses it to keep the rows a
++    // cancelled request already evaluated instead of rolling all the way back to its
++    // base checkpoint. One snapshot is ~157 MB, so after the first batch it is taken on
++    // a row interval (KVMEM_RESUME_INTERVAL, default 2048 rows ~ 4 s of prefill).
++    MultimodalCheckpoint mm_resume;
++    int mm_resume_row = -1;         // row of mm_resume, -1 = none
++    int mm_resume_max_row = -1;     // rows above this can never be selected later
++    int mm_resume_interval = kvmem_resume_interval_default();
++    bool mm_client_abort = false;   // the client RST this request (see finish_request)
+     std::shared_ptr<MultimodalCheckpoint> mm_rollback;
+     std::shared_ptr<kvmem_prompt> mm_rollback_prompt;
+     int mm_live_row = 0;
+@@ -422,6 +450,11 @@ static void memory_clear_all(ServerState & st) {
+     st.cached_tokens.clear();
+     st.cached_prompt.reset();
+     st.mm_checkpoints.clear();
++    st.mm_anchor = MultimodalCheckpoint{};
++    st.mm_resume = MultimodalCheckpoint{};
++    st.mm_resume_row = -1;
++    st.mm_resume_max_row = -1;
++    st.mm_client_abort = false;
+     st.mm_live_row = 0;
+     st.mm_live_checkpoint.reset();
+     st.mm_query.reset();
+@@ -1727,15 +1760,28 @@ int main(int argc, char ** argv) {
+                 return 1;
+             }
+         } else if (eq(arg, "--spec-type")) {
+-            const char * t = need(arg);
+-            if (eq(t, "draft-mtp")) {
++            const std::string t = need(arg);
++            st.spec_mtp = false;
++            st.spec_dflash = false;
++            st.spec_ngram_mod = false;
++            if (t == "none") {
++                // disabled
++            } else if (t == "draft-mtp") {
+                 st.spec_mtp = true;
+-            } else if (eq(t, "none")) {
+-                st.spec_mtp = false;
++            } else if (t == "draft-dflash") {
++                st.spec_dflash = true;
++            } else if (t == "draft-mtp,ngram-mod" || t == "ngram-mod,draft-mtp") {
++                st.spec_mtp = true;
++                st.spec_ngram_mod = true;
++            } else if (t == "draft-dflash,ngram-mod" || t == "ngram-mod,draft-dflash") {
++                st.spec_dflash = true;
++                st.spec_ngram_mod = true;
+             } else {
+-                fprintf(stderr, "unsupported --spec-type %s (P7-0: draft-mtp|none)\n", t);
++                fprintf(stderr, "unsupported --spec-type %s\n", t.c_str());
+                 return 1;
+             }
++        } else if (eq(arg, "--spec-draft-model")) {
++            st.spec_draft_model = need(arg);
+         } else if (eq(arg, "--spec-draft-n-max")) {
+             st.spec_n_max = kvmem_cli_int(arg, need(arg));
+         } else if (eq(arg, "--spec-draft-p-min")) {
+@@ -1858,6 +1904,10 @@ int main(int argc, char ** argv) {
+         fprintf(stderr, "KVMEM_STARTUP_ERROR replay MTP requires --spec-draft-n-max in 1..5\n");
+         return 1;
+     }
++    if (st.spec_dflash && st.spec_draft_model.empty()) {
++        fprintf(stderr, "KVMEM_STARTUP_ERROR draft-dflash requires --spec-draft-model\n");
++        return 1;
++    }
+ 
+     setvbuf(stderr, nullptr, _IONBF, 0);
+     setvbuf(stdout, nullptr, _IONBF, 0);
+@@ -1898,10 +1948,18 @@ int main(int argc, char ** argv) {
+         fprintf(stderr, "KVMEM_STARTUP_ERROR --mmproj file is missing or unreadable: %s\n", mmproj_path.c_str());
+         return 1;
+     }
++    if (st.spec_dflash && !readable(st.spec_draft_model)) {
++        fprintf(stderr, "KVMEM_STARTUP_ERROR --spec-draft-model file is missing or unreadable: %s\n",
++                st.spec_draft_model.c_str());
++        return 1;
++    }
+     if (!no_ui && !ui_dir.empty() && !readable((std::filesystem::path(ui_dir) / "index.html").string())) {
+         fprintf(stderr, "KVMEM_STARTUP_ERROR --ui-dir/--path must contain a readable index.html\n");
+         return 1;
+     }
++    const std::string active_spec_name = !(st.spec_mtp || st.spec_dflash) ? "none" :
++        std::string(st.spec_dflash ? "draft-dflash" : "draft-mtp") +
++        (st.spec_ngram_mod ? ",ngram-mod" : "");
+     json startup = {
+         {"model", model_path}, {"alias", st.model_name},
+         {"gpu", {{"device_requested", options.device_names.empty() ? "auto" : options.device_names},
+@@ -1912,7 +1970,7 @@ int main(int argc, char ** argv) {
+         {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
+         {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
+                    {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
+-        {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
++        {"spec_type", active_spec_name},
+         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu}}},
+         {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", 1}}},
+         {"auth", {{"enabled", !options.api_keys.empty()}, {"key_count", options.api_keys.size()}}},
+@@ -1944,8 +2002,9 @@ int main(int argc, char ** argv) {
+     cparams.n_seq_max = 1;
+     cparams.type_k = st.cache_type_k;
+     cparams.type_v = st.cache_type_v;
+-    if (st.spec_mtp) {
+-        const uint32_t n_out = (uint32_t) (1 + std::max(0, st.spec_n_max));
++    if (st.spec_mtp || st.spec_dflash) {
++        const uint32_t n_out = 1u + std::max((uint32_t) std::max(0, st.spec_n_max),
++                                             st.spec_ngram_mod ? 64u : 0u);
+         cparams.n_outputs_max = n_out;
+         cparams.n_outputs_max_per_seq = n_out;
+         cparams.n_rs_seq = (uint32_t) std::max(0, st.spec_n_max);
+@@ -1958,7 +2017,7 @@ int main(int argc, char ** argv) {
+     kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
+             llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
+             llama_flash_attn_type_name(cparams.flash_attn_type));
+-    if (st.spec_mtp) {
++    if (st.spec_mtp || st.spec_dflash) {
+         kvmem_spec_opts sopts;
+         sopts.n_max = st.spec_n_max;
+         sopts.p_min = st.spec_p_min;
+@@ -1973,6 +2032,12 @@ int main(int argc, char ** argv) {
+         sopts.type_k = st.cache_type_k;
+         sopts.type_v = st.cache_type_v;
+         sopts.draft_type = st.spec_cache_type;
++        sopts.dflash = st.spec_dflash;
++        sopts.ngram_mod = st.spec_ngram_mod;
++        // The plain DFlash cache is position-keyed and spans the full logical
++        // context rather than the compact target working set.
++        sopts.n_ctx_draft = n_ctx;
++        if (st.spec_dflash) sopts.draft_model = st.spec_draft_model;
+         if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
+             return 1;
+         }
+@@ -2074,7 +2139,13 @@ int main(int argc, char ** argv) {
+         // kvmem extensions (kept for existing clients)
+         // 中文：kvmem 扩展字段，保留以兼容既有客户端
+         {"role", "model"}, {"model_name", st.model_name},
+-        {"kvmem", {{"generation_limit", generation_limit},
++        {"kvmem", {{"enabled", st.kparams.enabled},
++            {"method", st.kparams.method == 1 ? "retrieval" : "recency"},
++            {"budget", st.kparams.budget}, {"generation_reserve", st.kparams.gen_reserve},
++            {"block_tokens", st.kparams.block_tokens},
++            {"kv_dtype", std::string(ggml_type_name(st.cache_type_k)) + "/" + ggml_type_name(st.cache_type_v)},
++            {"spec_type", active_spec_name}, {"spec_draft_n_max", st.spec_n_max},
++            {"generation_limit", generation_limit},
+             {"defaults", {{"enable_thinking", st.enable_thinking_default},
+                           {"reasoning_budget_tokens", st.reasoning_budget_default}, {"chat_template_kwargs", kwargs}}},
+             {"sampling", {{"thinking", thinking_params}, {"non_thinking", plain_params}}}}}
+@@ -2213,8 +2284,10 @@ int main(int argc, char ** argv) {
+             return;
+         }
+         st.active_prompt = parsed_prompt;
++        const bool prompt_has_media = parsed_prompt->has_media();
+         st.turn_generation_rows = (uint32_t) std::min<uint64_t>(UINT32_MAX,
+-                (uint64_t) std::max(0, cr.max_tokens) + (st.spec.ok ? std::max(0, st.spec_n_max) + 1u : 0u));
++                (uint64_t) std::max(0, cr.max_tokens) +
++                (st.spec.ok && !prompt_has_media ? std::max(0, st.spec_n_max) + 1u : 0u));
+         auto toks = parsed_prompt->tokens;
+         if (toks.empty()) {
+             res.status = 400;
+@@ -2240,11 +2313,11 @@ int main(int argc, char ** argv) {
+                 st.turn_query_exact = derive_native_query_span(st, prompt, inputs, *parsed_prompt, qbegin, qend);
+             }
+         }
+-        if (parsed_prompt->has_media() && cr.query_begin < 0 && !st.turn_query_exact) {
++        if (prompt_has_media && cr.query_begin < 0 && !st.turn_query_exact) {
+             // The final text question follows native visual chunks and their boundaries.
+             int last_media_end = 0;
+             for (const auto & range : parsed_prompt->media_ranges()) last_media_end = range.second;
+-            qend = (int) toks.size() - (st.spec.ok ? 1 : 0);
++            qend = (int) toks.size() - (st.spec.ok && !prompt_has_media ? 1 : 0);
+             qbegin = std::max(last_media_end, qend - st.query_max_tokens);
+         }
+         clamp_query_span(st, qbegin, qend);
+@@ -2318,7 +2391,10 @@ int main(int argc, char ** argv) {
+         const bool parse_tools = !cr.tools.empty() &&
+                 cr.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+ 
+-        bool use_spec = st.spec.ok;
++        bool use_spec = st.spec.ok && !prompt_has_media;
++        if (prompt_has_media && st.spec.ok) {
++            kvmem_diag("KVMEM_TRACE spec_bypass reason=multimodal_prompt\n");
++        }
+         if (use_spec && !sparams.grammar.empty()) {
+             try {
+                 common_params_sampling probe = sparams;
+@@ -2332,11 +2408,12 @@ int main(int argc, char ** argv) {
+             }
+         }
+ 
+-        if ((st.vision || st.query_policy_user) && st.spec.ok && !use_spec) {
++        if ((st.vision || st.query_policy_user) && st.spec.ok && !use_spec && !prompt_has_media) {
+             res.status = 400;
+             res.set_content("{\"error\":\"MTP sampler could not initialize for this request\"}", "application/json");
+             return;
+         }
++        st.turn_spec_enabled = use_spec;
+ 
+         json request_params = default_params;
+         request_params["n_predict"] = cr.max_tokens;
+@@ -2460,7 +2537,7 @@ int main(int argc, char ** argv) {
+                             send(json{{"error", st.mm_error.empty() ? "prefill/retrieval failed" : st.mm_error}}.dump());
+                             sink.write("data: [DONE]\n\n", 14);
+                         }
+-                        multimodal_finish_request(st);
++                        multimodal_finish_request(st, io.aborted);
+                         slot->unlock();
+                         sink.done();
+                         return true;
+@@ -2552,7 +2629,11 @@ int main(int argc, char ** argv) {
+                         }
+                         common_sampler_free(smpl);
+                         if (aborted) {
+-                            multimodal_finish_request(st);
++                            // A client RST during generation is a cancellation, not a
++                            // decode failure. Preserve the generation-start resume
++                            // checkpoint so an interjected follow-up does not cold-load
++                            // the whole prompt again.
++                            multimodal_finish_request(st, io.aborted);
+                             slot->unlock();
+                             sink.done();
+                             return true;
+@@ -2583,7 +2664,10 @@ int main(int argc, char ** argv) {
+                         return true;
+                     }
+                     if (aborted) {
+-                        multimodal_finish_request(st);
++                        // kvmem_spec_generate reports both client cancellation and
++                        // internal failure through this branch. Only io.aborted may
++                        // retain the completed prefill; failures still roll to base.
++                        multimodal_finish_request(st, io.aborted);
+                         slot->unlock();
+                         sink.done();
+                         return true;
+@@ -2659,7 +2743,10 @@ int main(int argc, char ** argv) {
+                 return;
+             }
+             st.mm_live_row = gst.n_past;
+-            if (io.aborted) return;
++            if (io.aborted) {
++                multimodal_finish_request(st, true);
++                return;
++            }
+             emit_gen_wall((int) gen.size());
+             commit_cached(st, toks, gen);
+             emit_json(content, (int) gen.size(), (int) gen.size() >= cr.max_tokens);
+@@ -2705,6 +2792,7 @@ int main(int argc, char ** argv) {
+         while ((int) gen.size() < cr.max_tokens && !stopped) {
+             if (!stream_heartbeat(&io)) {
+                 common_sampler_free(smpl);
++                multimodal_finish_request(st, true);
+                 return;
+             }
+             std::string piece;
+@@ -2744,7 +2832,7 @@ int main(int argc, char ** argv) {
+     LOG_INF("srv    llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
+             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
+             st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
+-            st.spec.ok ? "draft-mtp" : "off", st.spec_n_max, (int) st.enable_thinking_default,
++            active_spec_name.c_str(), st.spec_n_max, (int) st.enable_thinking_default,
+             st.reasoning_budget_default, st.query_max_tokens);
+     if (!svr.listen_after_bind()) {
+         fprintf(stderr, "listen failed\n");
+diff --git a/ui/lightweight/+page.svelte b/ui/lightweight/+page.svelte
+index bc932f8..43b13f5 100644
+--- a/ui/lightweight/+page.svelte
++++ b/ui/lightweight/+page.svelte
+@@ -171,7 +171,11 @@
+   </aside>
+   <main>
+     <header>
+-      <div><strong>{props?.model_name ?? '正在连接...'}</strong><small>{props ? `${props.default_generation_settings.n_ctx.toLocaleString()} 上下文 · ${props.modalities.vision ? '支持图片' : '文本'}` : ''}</small></div>
++      <div class="model-info">
++        <strong>{props?.model_name ?? '正在连接...'}</strong>
++        {#if props?.model_path}<small title={props.model_path}>{props.model_path}</small>{/if}
++        <small>{props ? `${props.default_generation_settings.n_ctx.toLocaleString()} 上下文 · KVMem ${props.kvmem.method} ${props.kvmem.budget.toLocaleString()}+${props.kvmem.generation_reserve.toLocaleString()} · ${props.kvmem.kv_dtype} · ${props.kvmem.spec_type} n${props.kvmem.spec_draft_n_max} · ${props.modalities.vision ? '支持图片' : '文本'}` : ''}</small>
++      </div>
+       <div class="actions"><Button variant="outline" onclick={()=>settingsOpen=!settingsOpen}>参数</Button>{#if active}<Button variant="ghost" disabled={busy || loadingHistory} onclick={removeConversation}>删除对话</Button>{/if}</div>
+     </header>
+     {#if settingsOpen}

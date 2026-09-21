@@ -2,6 +2,9 @@ config.ps1
 *.log
 *.gguf
 build/
+build-win/
+kvmem-llama.cpp/
+logs/
 .vscode/
 .DS_Store
 Thumbs.db

@@ -34,9 +34,12 @@ cmake -S llama.cpp -B build -G Ninja ^
 
 `75-real` rather than `75` keeps the build from emitting PTX the card is too old
 to JIT; the local 8080 build also compiles `86` because the same tree is shared
-with another machine. Mode B additionally needs the KVMem integration listed in
-[ENGINE_NOTES.md](ENGINE_NOTES.md) — the flags below do not exist in stock
-llama.cpp.
+with another machine. Mode B additionally needs the KVMem integration, published
+as [`patches/kvmem-outer-local-changes.patch`](../patches/kvmem-outer-local-changes.patch)
+and [`patches/llama-kvmem-current.patch`](../patches/llama-kvmem-current.patch) —
+none of the `--kvmem-*` flags below exist in stock upstream. Replay with
+`scripts/apply-engine-patches.sh` or `scripts/bootstrap-engine.ps1`; see
+[ENGINE_NOTES.md](ENGINE_NOTES.md).
 
 ---
 
