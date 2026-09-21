@@ -1,10 +1,14 @@
-# 256K local LLM on an RTX 2080 Ti 22 GB
+# The Ultimate Qwen3.8-27B Deployment for RTX 2080 Ti
+
+## 256K context · 67 tok/s · Q4_K_M-class quality on a 2018 Turing GPU
 
 [中文说明](README_ZH.md)
 
-A reproducible deployment recipe for running a Qwen3.8-class 27B model on an old Turing card while keeping **speed, long context and answer quality in the same setup**.
+A performance-first recipe that pushes a modified 22 GB RTX 2080 Ti close to its limit: a modern 27B hybrid model, a 1.9B DFlash2 drafter, 256K logical context and multimodal support—all on one old Turing card.
 
-> **RTX 2080 Ti 22 GB · 256K logical context · ~67 tok/s simple workloads · ~45–48 tok/s daily use · DFlash2 + n-gram speculation**
+**This is the most aggressive and balanced Qwen3.8 deployment we know of for a single 22 GB RTX 2080 Ti.** It keeps speed, long context and answer quality in the same setup instead of sacrificing two to maximize one.
+
+> **RTX 2080 Ti 22 GB · 256K context · 67 tok/s simple workloads · 45–48 tok/s daily use · DFlash2 + near-free n-gram reuse**
 
 ![Pelican bicycle animation generated as a creative coding test](assets/pelican-bike.gif)
 
